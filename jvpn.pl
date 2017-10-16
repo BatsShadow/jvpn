@@ -64,9 +64,10 @@ my $script=$Config{"script"};
 my $cfgpass=$Config{"password"};
 my $workdir=$Config{"workdir"};
 my $password="";
+my $token="";
 my $hostchecker=$Config{"hostchecker"};
 my $reconnect=$Config{"reconnect"};
-my $token=$Config{"token"};
+my $use_token=$Config{"token"};
 my $tncc_pid = 0;
 
 my $supportdir = $ENV{"HOME"}."/.juniper_networks";
@@ -125,7 +126,7 @@ if (-e "./ncsvc") {
   my $fmode = (stat("./ncsvc"))[2];
   $is_setuid = ($fmode & S_ISUID) && ((stat("./ncsvc"))[4] == 0);
   if(!-x "./ncsvc"){
-    print "./ncsvc is not executable, exiting\n"; 
+    print "./ncsvc is not executable, exiting\n";
     exit 1;
   }
 }
@@ -140,7 +141,16 @@ my $ua = LWP::UserAgent->new;
 if(defined &LWP::UserAgent::ssl_opts) {
     $ua->ssl_opts('verify_hostname' => $verifycert);
 }
+# my $cookies = HTTP::Cookies->new();
+# $cookies->set_cookie(0,'DSSIGNIN', 'url_11','/',$dhost,$dport,0,0,86400,0);
+# $cookies->set_cookie(0,'DSSignInURL', '/linux','/',$dhost,$dport,0,0,86400,0);
+# $cookies->set_cookie(0,'DSSigninNotif', '1','/',$dhost,$dport,0,0,86400,0);
+# $ua->cookie_jar($cookies);
 $ua->cookie_jar({});
+$ua->cookie_jar->set_cookie(0,'DSSIGNIN', $durl,'/',$dhost,$dport,0,0,86400,0, ());
+$ua->cookie_jar->set_cookie(0,'DSSignInURL', '/linux','/',$dhost,$dport,0,0,86400,0, ());
+$ua->cookie_jar->set_cookie(0,'DSSigninNotif', '1','/',$dhost,$dport,0,0,86400,0, ());
+
 push @{ $ua->requests_redirectable }, 'POST';
 
 # if Juniper VPN server finds some 'known to be smart' useragent it will try to
@@ -170,10 +180,7 @@ my ($socket,$client_socket,$data);
 # Trigger the main sub (which is wrapped as a sub so reconnections are possible)
 connect_vpn();
 
-sub connect_vpn {
-  my $response_body = '';
-  my $cont_button = '';
-
+sub password_prompt {
   if ($cfgpass eq "interactive") {
     print "Enter password: ";
     $password=read_input("password");
@@ -189,15 +196,27 @@ sub connect_vpn {
     $password=run_pw_helper($1);
   }
 
-  if ($token) {
+  if ($use_token) {
     print "Enter token: ";
-    $password = $password . read_input();
+    $token = read_input();
     print "\n";
+  }
+}
+
+sub connect_vpn {
+  password_prompt();
+
+  my $response_body = '';
+  my $cont_button = '';
+
+  my $firstpass = $password;
+  if ($use_token) {
+    $firstpass = $token;
   }
 
   my $res = $ua->post("https://$dhost:$dport/dana-na/auth/$durl/login.cgi",
     [ btnSubmit   => 'Sign In',
-    password  => $password,
+    password  => $firstpass,
     realm => $realm,
     tz   => '60',
     username  => $username,
@@ -212,39 +231,12 @@ sub connect_vpn {
   if ($res->is_success) {
     print("Initial connection successful\n");
     # next token request
-    if ($response_body =~ /name="frmDefender"/ || $response_body =~ /name="frmNextToken"/) {
+    if ($use_token) {
       $response_body =~ m/name="key" value="([^"]+)"/;
       my $key=$1;
-      print  "The server requires that you enter an additional token ".
-        "code to verify that your credentials are valid.\n";
-      # grid cards. $1 contains grid reference
-      if ($response_body =~ /Challenge:([^"]+)\./) {
-        print $1;
-        print "\n";
-        print "Enter challenge response: ";
-        $password=read_password();
-        print "\n";
-      }
-      # if password was specified in plaintext we should not use it 
-      # here, it will not work anyway
-      elsif ($cfgpass eq "interactive" || $cfgpass =~ /^plaintext:/) {
-        print "To continue, wait for the token code to change and ".
-        "then enter your password and new PIN.\n";
-        print "Enter password+PIN: ";
-        $password=read_password();
-        print "\n";
-      }
-      elsif ($cfgpass =~ /^helper:(.+)/) {
-        print "Using user-defined script to get second password\n";
-        # set current password to the OLDPIN variable to make 
-        # helper aware that we need a new key
-        $ENV{'OLDPIN'}=$password;
-        $password=run_pw_helper($1);
-        delete $ENV{'OLDPIN'}; 
-      }
       $res = $ua->post("https://$dhost:$dport/dana-na/auth/$durl/login.cgi",
-        [ Enter   => 'secidactionEnter',
-        password  => $password,
+        [ btnSubmit   => 'Sign In',
+        'password#2'  => $password,
         key  => $key,
         ]);
       $response_body=$res->decoded_content;
@@ -275,7 +267,7 @@ sub connect_vpn {
       }
       # now we got preauth, so lets try to start tncc
       $tncc_pid = tncc_start($res->decoded_content);
-      open NARPORT, $narport_file or die $!; 
+      open NARPORT, $narport_file or die $!;
       my $narport = <NARPORT>;
       chomp $narport;
       close NARPORT;
@@ -397,7 +389,7 @@ sub connect_vpn {
     else {
       $dlast=time();
     }
-    
+
     # do not print DSID in normal mode for security reasons
     print $debug?"Got DSID=$dsid, dfirst=$dfirst, dlast=$dlast\n":"";
 
@@ -407,7 +399,7 @@ sub connect_vpn {
     } else {
       print "Got DSID\n";
     }
-    
+
   }
   else {
     # Error code, type of error, error message
@@ -425,7 +417,7 @@ sub connect_vpn {
   $| = 1;
 
   my $md5hash = '';
-  my $crtfile = ''; 
+  my $crtfile = '';
   my $fh; # should be global or file is unlinked
 
   if($mode eq "ncsvc") {
@@ -542,7 +534,7 @@ sub connect_vpn {
     my $status = sprintf("%02x",$result[7]);
     # 0x6d seems to be "Connect ok" message
     # exit on any other values
-    
+
     if($status ne "6d") {
       printf("Status=$status\nAuthentication failed, exiting\n");
       system("./ncsvc -K");
@@ -590,7 +582,7 @@ sub connect_vpn {
       $ENV{'INTERFACE'}=$vpnint;
       system($script);
     }
-    
+
     for (;;) {
         $exists = kill SIGCHLD, $pid;
         $debug && printf("\nChecking child: exists=$exists, $pid\n");
@@ -600,7 +592,7 @@ sub connect_vpn {
         while (<STAT>) {
               if ($_ =~ m/^\s*${vpnint}:\s*(\d+)(?:\s+\d+){7}\s*(\d+)/) {
                     print "\r                                                              \r";
-                    printf("Duration: %02d:%02d:%02d  Sent: %s\tReceived: %s", 
+                    printf("Duration: %02d:%02d:%02d  Sent: %s\tReceived: %s",
                           int($now / 3600), int(($now % 3600) / 60), int($now % 60),
                           format_bytes($2), format_bytes($1));
               }
@@ -657,14 +649,14 @@ sub connect_vpn {
       my $now = time - $start_t;
       # printing RX/TX. This packet also contains encription type,
       # compression and transport info, but length seems to be variable
-      printf("Duration: %02d:%02d:%02d  Sent: %s\tReceived: %s", 
+      printf("Duration: %02d:%02d:%02d  Sent: %s\tReceived: %s",
         int($now / 3600), int(($now % 3600) / 60), int($now % 60),
         format_bytes(unpack('x[78]N',$data)), format_bytes(unpack('x[68]N',$data)));
       sleep(1);
     }
 
     print "Exiting... Connect failed?\n";
-    
+
     $socket->close();
   } # mode ncsvc loop
 }
@@ -684,15 +676,15 @@ sub hdump {
       push(@array, '  ') while $len++ < 16;
       $format="0x%08x (%05d)" .
         "   %s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s   %s\n";
-      
-    } 
+
+    }
     $data =~ tr/\0-\37\177-\377/./;
     printf $format,$offset,$offset,@array,$data;
     $offset += 16;
   }
 }
 
-# handle ctrl+c to logout and kill ncsvc 
+# handle ctrl+c to logout and kill ncsvc
 sub INT_handler {
   # de-register handlers
   $SIG{'INT'} = 'DEFAULT';
@@ -930,7 +922,7 @@ sub format_bytes
 sub get_tap_interfaces
 {
   my @intlist;
-  open FILE, "/proc/net/dev" or die $!; 
+  open FILE, "/proc/net/dev" or die $!;
   while (my $line = <FILE>){
     if($line =~ /^\s*(tun[0-9]+):/) {
       push(@intlist, $1);
